@@ -22,8 +22,9 @@ P = ctypes.c_char_p
 _SIGNATURES = {
     "mvw_uniform_hash": ([I, I, I], I),
     "mvw_hash_string": ([I, I, I, I], I),
-    "mvw_hash_many": ([I, I, I, I, I, I, I], None),
+    "mvw_hash_many": ([I, I, I, I, I, I, I, I, I], None),
     "mvw_parse_line": ([P] + [I] * 10, I),
+    "mvw_learn_text": ([P] + [I] * 15 + [F, F, F, F] + [I] * 8, I),
     "mvw_predict_many": ([I, I, I, I, I, I, I, I, F, F, I], None),
     "mvw_learn_many": (
         [I] * 12 + [I, I, F, F, F, F] + [I] * 6,

@@ -1,7 +1,9 @@
 """Hashed online linear learning kernels exposed through a C ABI."""
 
+from max.algorithm import parallelize
 from std.math import exp, log, pow, sqrt
-from std.sys.info import simd_width_of
+from std.sys.info import num_physical_cores, simd_width_of
+from std.utils.numerics import isfinite
 
 comptime BPtr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
 comptime U32Ptr = UnsafePointer[UInt32, AnyOrigin[mut=True]]
@@ -12,6 +14,8 @@ comptime F64Ptr = UnsafePointer[Float64, AnyOrigin[mut=True]]
 
 comptime MURMUR_C1: UInt32 = 0xCC9E2D51
 comptime MURMUR_C2: UInt32 = 0x1B873593
+comptime PARALLEL_HASH_THRESHOLD = 1_000_000
+comptime MAX_HASH_WORKERS = 8
 
 
 def rotl32(value: UInt32, shift: UInt32) -> UInt32:
@@ -330,18 +334,40 @@ def mvw_hash_many(
     count: Int,
     mask: Int,
     hash_all: Int,
+    shared_seed: Int,
+    delimited: Int,
 ) abi("C"):
     var data = BPtr(unsafe_from_address=data_addr)
     var offsets = I64Ptr(unsafe_from_address=offsets_addr)
     var seeds = U32Ptr(unsafe_from_address=seeds_addr)
     var result = U64Ptr(unsafe_from_address=result_addr)
 
-    for i in range(count):
+    @parameter
+    def hash_one(i: Int):
         var start = Int(offsets[i])
         var end = Int(offsets[i + 1])
+        if delimited != 0:
+            end -= 1
+        var seed = seeds[0] if shared_seed != 0 else seeds[i]
         result[i] = UInt64(
-            hash_string(data + start, end - start, seeds[i], hash_all != 0)
+            hash_string(data + start, end - start, seed, hash_all != 0)
         ) & UInt64(mask)
+
+    if count >= PARALLEL_HASH_THRESHOLD:
+        var workers = min(MAX_HASH_WORKERS, num_physical_cores())
+        var chunk_size = (count + workers - 1) // workers
+
+        @parameter
+        def hash_chunk(worker: Int):
+            var start = worker * chunk_size
+            var end = min(start + chunk_size, count)
+            for i in range(start, end):
+                hash_one(i)
+
+        parallelize[hash_chunk](workers, workers)
+    else:
+        for i in range(count):
+            hash_one(i)
 
 
 @export("mvw_parse_line")
@@ -698,3 +724,104 @@ def mvw_learn_many(
     state[0] = t
     state[1] = total_weight
     state[2] = normalized_sum
+
+
+@export("mvw_learn_text")
+def mvw_learn_text(
+    data_addr: Int,
+    length: Int,
+    weights_addr: Int,
+    accumulators_addr: Int,
+    normalizers_addr: Int,
+    indices_addr: Int,
+    values_addr: Int,
+    offsets_addr: Int,
+    labels_addr: Int,
+    importance_addr: Int,
+    initial_addr: Int,
+    predictions_addr: Int,
+    state_addr: Int,
+    bounds_addr: Int,
+    capacity: Int,
+    mask: Int,
+    eta: Float32,
+    power_t: Float32,
+    logistic_min: Float32,
+    logistic_max: Float32,
+    loss: Int,
+    adaptive_arg: Int,
+    normalized_arg: Int,
+    invariant_arg: Int,
+    dynamic_bounds_arg: Int,
+    link: Int,
+    hash_all_arg: Int,
+    noconstant_arg: Int,
+) abi("C") -> Int:
+    var count = mvw_parse_line(
+        data_addr,
+        length,
+        indices_addr,
+        values_addr,
+        labels_addr,
+        importance_addr,
+        initial_addr,
+        capacity,
+        mask,
+        hash_all_arg,
+        noconstant_arg,
+    )
+    if count < 0:
+        return count
+
+    var labels = F32Ptr(unsafe_from_address=labels_addr)
+    var importance = F32Ptr(unsafe_from_address=importance_addr)
+    var initial = F32Ptr(unsafe_from_address=initial_addr)
+    var values = F32Ptr(unsafe_from_address=values_addr)
+    if (
+        not isfinite(labels[0])
+        or not isfinite(importance[0])
+        or not isfinite(initial[0])
+    ):
+        return -3
+    comptime W = simd_width_of[DType.float64]()
+    var i = 0
+    var vector_end = count - count % W
+    while i < vector_end:
+        if not isfinite(values.load[width=W](i)).reduce_and():
+            return -3
+        i += W
+    while i < count:
+        if not isfinite(values[i]):
+            return -3
+        i += 1
+
+    var offsets = I64Ptr(unsafe_from_address=offsets_addr)
+    offsets[0] = Int64(0)
+    offsets[1] = Int64(count)
+    mvw_learn_many(
+        weights_addr,
+        accumulators_addr,
+        normalizers_addr,
+        indices_addr,
+        values_addr,
+        offsets_addr,
+        labels_addr,
+        importance_addr,
+        initial_addr,
+        predictions_addr,
+        state_addr,
+        bounds_addr,
+        1,
+        mask,
+        eta,
+        power_t,
+        logistic_min,
+        logistic_max,
+        loss,
+        adaptive_arg,
+        normalized_arg,
+        invariant_arg,
+        dynamic_bounds_arg,
+        link,
+    )
+    return count

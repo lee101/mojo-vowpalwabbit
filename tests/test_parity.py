@@ -55,7 +55,7 @@ def test_published_murmur_hash_vectors():
 
 
 def test_hash_many_matches_scalar_and_upstream():
-    names = [f"feature_{i}" for i in range(1000)] + ["5", "42", "ü"]
+    names = [f"feature_{i}" for i in range(1000)] + ["5", "42", "ü", "x\0y"]
     ours = mvw.Workspace("--quiet -b 19")
     upstream = UpstreamWorkspace("--quiet -b 19")
     seed = ours.hash_space("a")
@@ -69,6 +69,16 @@ def test_hash_many_matches_scalar_and_upstream():
     )
     assert np.array_equal(got, expected)
     upstream.finish()
+
+
+def test_hash_many_parallel_path_matches_scalar():
+    count = 1_000_003
+    ours = mvw.Workspace("--quiet -b 19")
+    seed = ours.hash_space("a")
+    expected = ours.hash_feature("parallel", seed)
+    got = ours.hash_features(["parallel"] * count, seed)
+    assert got.shape == (count,)
+    assert np.all(got == expected)
 
 
 def test_text_parser_feature_parity():
@@ -271,6 +281,22 @@ def test_native_text_learning_matches_packed_path(args):
         packed.learn_many([packed.parse(line)])
     assert direct._state == pytest.approx(packed._state)
     assert direct._bounds == pytest.approx(packed._bounds)
+    np.testing.assert_allclose(direct.weights, packed.weights, rtol=0, atol=2e-6)
+    np.testing.assert_allclose(
+        direct._accumulators, packed._accumulators, rtol=0, atol=2e-6
+    )
+
+
+def test_native_text_fused_simd_full_width_and_tail():
+    direct = mvw.Workspace("--quiet --noconstant")
+    packed = mvw.Workspace("--quiet --noconstant")
+    for count in (3, 4, 5, 9):
+        line = "1 |a " + " ".join(
+            f"x{i}:{(i + 1) / 7}" for i in range(count)
+        )
+        direct.learn(line)
+        packed.learn_many([packed.parse(line)])
+    assert direct._state == pytest.approx(packed._state)
     np.testing.assert_allclose(direct.weights, packed.weights, rtol=0, atol=2e-6)
     np.testing.assert_allclose(
         direct._accumulators, packed._accumulators, rtol=0, atol=2e-6

@@ -545,8 +545,25 @@ class Workspace:
         model = options.get("initial_regressor")
         if model:
             self._load(model)
+        self._model_arrays = (
+            self.weights,
+            self._accumulators,
+            self._normalizers,
+            self._state,
+            self._bounds,
+        )
+        self._model_addresses = tuple(addr(array) for array in self._model_arrays)
+        self._learn_text_native = lib().mvw_learn_text
 
     def _validated_model_addresses(self) -> tuple[int, ...]:
+        if (
+            self.weights is self._model_arrays[0]
+            and self._accumulators is self._model_arrays[1]
+            and self._normalizers is self._model_arrays[2]
+            and self._state is self._model_arrays[3]
+            and self._bounds is self._model_arrays[4]
+        ):
+            return self._model_addresses
         arrays = (
             ("weights", self.weights, np.dtype(np.float32), 1 << self.bits),
             ("accumulators", self._accumulators, np.dtype(np.float32), 1 << self.bits),
@@ -565,7 +582,9 @@ class Workspace:
                 raise TypeError(
                     f"model {name} must be a contiguous 1-D {dtype} array of length {length}"
                 )
-        return tuple(addr(array) for _, array, _, _ in arrays)
+        self._model_arrays = tuple(array for _, array, _, _ in arrays)
+        self._model_addresses = tuple(addr(array) for array in self._model_arrays)
+        return self._model_addresses
 
     @staticmethod
     def _parse_options(tokens: list[str]) -> tuple[dict, set[str]]:
@@ -701,20 +720,28 @@ class Workspace:
 
     def hash_features(self, features: Iterable[str], namespace_hashes=0) -> np.ndarray:
         names = features if isinstance(features, (list, tuple)) else list(features)
-        encoded = [name.encode("utf-8") for name in names]
-        joined = b"".join(encoded)
+        joined_text = "\0".join(names) + "\0"
+        delimited = int(joined_text.isascii())
+        if delimited:
+            joined = joined_text.encode("ascii")
+            lengths = (len(name) + 1 for name in names)
+        else:
+            encoded = [name.encode("utf-8") for name in names]
+            joined = b"".join(encoded)
+            lengths = (len(item) for item in encoded)
         data = np.frombuffer(joined if joined else b"\0", dtype=np.uint8)
         offsets = np.empty(len(names) + 1, dtype=np.int64)
         offsets[0] = 0
         np.cumsum(
-            np.fromiter((len(item) for item in encoded), dtype=np.int64),
+            np.fromiter(lengths, dtype=np.int64),
             out=offsets[1:],
         )
         if np.isscalar(namespace_hashes):
             seed = int(namespace_hashes)
             if not 0 <= seed <= np.iinfo(np.uint32).max:
                 raise ValueError("namespace hash must fit in uint32")
-            seeds = np.full(len(names), seed, dtype=np.uint32)
+            seeds = np.array([seed], dtype=np.uint32)
+            shared_seed = 1
         else:
             raw_seeds = list(namespace_hashes)
             if len(raw_seeds) != len(names):
@@ -722,6 +749,7 @@ class Workspace:
             if any(not 0 <= int(seed) <= np.iinfo(np.uint32).max for seed in raw_seeds):
                 raise ValueError("namespace hashes must fit in uint32")
             seeds = np.ascontiguousarray(raw_seeds, dtype=np.uint32)
+            shared_seed = 0
         result = np.empty(len(names), dtype=np.uint64)
         if names:
             lib().mvw_hash_many(
@@ -732,6 +760,8 @@ class Workspace:
                 len(names),
                 self.mask,
                 int(self.hash_all),
+                shared_seed,
+                delimited,
             )
         return result
 
@@ -881,11 +911,14 @@ class Workspace:
     def _learn_text(self, line: str) -> bool:
         if (
             not line
-            or not line.isascii()
             or "\n" in line
             or "\r" in line
             or self.quadratics
         ):
+            return False
+        try:
+            encoded = line.encode("ascii")
+        except UnicodeEncodeError:
             return False
         (
             indices_addr,
@@ -896,32 +929,10 @@ class Workspace:
             initial_addr,
             prediction_addr,
         ) = self._text_addresses
-        encoded = line.encode("ascii")
-        count = lib().mvw_parse_line(
+        model_addresses = self._validated_model_addresses()
+        count = self._learn_text_native(
             encoded,
             len(encoded),
-            indices_addr,
-            values_addr,
-            labels_addr,
-            importance_addr,
-            initial_addr,
-            len(self._text_indices),
-            self.mask,
-            int(self.hash_all),
-            int(self.noconstant),
-        )
-        if count < 0:
-            return False
-        if not (
-            np.isfinite(self._text_labels[0])
-            and np.isfinite(self._text_importance[0])
-            and np.isfinite(self._text_initial[0])
-            and np.all(np.isfinite(self._text_values[:count]))
-        ):
-            raise ValueError("label, importance, initial prediction, and features must fit in float32")
-        self._text_offsets[1] = count
-        model_addresses = self._validated_model_addresses()
-        lib().mvw_learn_many(
             model_addresses[0],
             model_addresses[1],
             model_addresses[2],
@@ -934,7 +945,7 @@ class Workspace:
             prediction_addr,
             model_addresses[3],
             model_addresses[4],
-            1,
+            len(self._text_indices),
             self.mask,
             self.eta,
             self.power_t,
@@ -946,7 +957,13 @@ class Workspace:
             int(self.invariant),
             int(self._dynamic_bounds),
             self.link_code,
+            int(self.hash_all),
+            int(self.noconstant),
         )
+        if count == -3:
+            raise ValueError("label, importance, initial prediction, and features must fit in float32")
+        if count < 0:
+            return False
         return True
 
     def learn(self, ec) -> None:

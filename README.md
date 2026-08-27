@@ -107,24 +107,30 @@ conda-forge `vowpalwabbit` 9.10.
 
 | case | mojo-vowpalwabbit | vowpalwabbit 9.10 | result |
 | --- | ---: | ---: | ---: |
-| hash 500k feature names | 219.06 ms | 281.39 ms | 1.28x faster |
-| predict 30k packed, 16 features | 12.78 ms | 277.01 ms | 21.67x faster |
-| learn 50k packed, 12 features | 42.59 ms | 132.61 ms | 3.11x faster |
-| learn 20k VW strings, 12 features | 1310.68 ms | 267.60 ms | 4.90x slower |
-| learn 15k packed with 8x8 quadratic | 21.01 ms | 45.73 ms | 2.18x faster |
+| hash 500k feature names | 78.27 ms | 164.02 ms | 2.10x faster |
+| predict 30k packed, 16 features | 7.80 ms | 138.67 ms | 17.77x faster |
+| learn 50k packed, 12 features | 21.10 ms | 126.01 ms | 5.97x faster |
+| learn 20k VW strings, 12 features | 147.59 ms | 180.27 ms | 1.22x faster |
+| learn 15k packed with 8x8 quadratic | 22.59 ms | 56.51 ms | 2.50x faster |
 
 The packed rows exclude preprocessing on both sides: this port receives a
 reusable CSR batch and upstream receives reusable parsed `Example` objects.
 They expose the intended compute path and avoid tens of thousands of Python
 to native calls. The string row includes parsing. ASCII, non-interaction
-`learn(str)` calls now parse in Mojo into reusable NumPy scratch buffers,
-eliminating per-feature FFI calls and per-row CSR allocation. Non-ASCII input,
+`learn(str)` calls now parse, validate, predict, and update in one fused Mojo
+call using reusable NumPy scratch buffers, eliminating per-feature FFI calls,
+per-row CSR allocation, and a second native boundary crossing. Non-ASCII input,
 quadratic interactions, unusual numeric syntax, and rows over the scratch
-capacity retain the Python compatibility path. Batched hashing avoids a
-redundant input copy and is at parity with upstream in this run.
+capacity retain the Python compatibility path. Batched ASCII hashing encodes
+directly into one delimiter-backed buffer and reuses a scalar namespace seed
+instead of allocating one seed per feature.
 
-No GPU or parallel hashing path is included. Online learning preserves input
-order and has a sequential update dependency between rows.
+Hash batches of at least one million independent names use up to eight CPU
+workers; smaller batches stay serial to avoid launch overhead. The `max`
+dependency supplies Mojo's CPU parallel runtime. No GPU path is included:
+Murmur hashing is integer and branch work, while the sparse learner has random
+model traffic and a sequential update dependency between rows. Neither offers
+enough floating-point arithmetic intensity to amortize device transfers.
 
 ## How it works
 
@@ -152,8 +158,10 @@ dtypes, contiguity, dimensions, offsets, finite float32 values, and batch
 ownership before native code dereferences a packed buffer. Sparse prediction
 loads contiguous feature indices and values at the host SIMD width, gathers
 weights, reduces each vector, and finishes with a scalar remainder loop.
-Single-row text scratch storage is retained across calls. All exports live in
-one compilation unit to keep the Mojo shared-library build simple.
+Single-row text scratch storage and validated model addresses are retained
+across calls. Fused text validation uses host-width SIMD loads plus a scalar
+tail. All exports live in one compilation unit to keep the Mojo shared-library
+build simple.
 
 ## License
 
